@@ -28,11 +28,13 @@ A small always-available Windows desktop widget for Steam developers. It shows y
   - Total outstanding wishlists
   - Current players and 24h peak for the game and its demo
   - Net revenue and units sold
+  - Steam store ranks: daily active users (DAU), top sellers and wishlist activity
+  - Followers, plus review count and positive percentage
 - **Live player hint**: when a row is collapsed and someone is playing, a small purple badge shows it (`● 3 in game · 12 in demo`).
 - **One-click links** on every game and demo row:
   - **Detail** opens the app's Steamworks *Sales & Activations* details page, where the median playtime and lifetime stats live
   - **SteamDB** opens the SteamDB player chart
-- **Hourly refresh** aligned to the clock (13:00, 14:00, …), plus a manual refresh button.
+- **Hourly refresh** aligned to the clock (13:00, 14:00, …), plus a manual refresh button that also picks up newly added games and demos.
 - **Configurable day boundary**: by default the day rolls over at 10:00 local time in Türkiye, which is midnight Pacific in summer, matching Steam's own reporting day.
 - **Resilient**: when Steam is down or you are offline, the last known numbers stay on screen with a small warning.
 - **Lightweight**: a single Python file that uses only the standard library (tkinter). No pip installs.
@@ -187,7 +189,7 @@ Restart the widget after editing `config.json`.
 | Click a game row | Expand or collapse its details. The state is remembered. |
 | **Detail** link | Opens `partner.steampowered.com/app/details/<appid>/` for that game or demo, covering all time up to today. |
 | **SteamDB** link | Opens the SteamDB charts page for that app. |
-| ⟳ button | Refresh now. |
+| ⟳ button | Refresh now. This also re-checks your Steamworks account for new games and demos. |
 | ✕ button | Close the widget. |
 | Right-click | Menu: Refresh, Always on top, Start with Windows, Open settings, Close. |
 
@@ -199,6 +201,8 @@ Restart the widget after editing `config.json`.
 | **Wishlists** tile | Total outstanding wishlists, summed over all games. |
 | **Players** tile | Players online right now in all games and demos. |
 | **Revenue** tile | Net revenue (USD) for today, or for the latest day Steam has published, with that day shown in the label. |
+| **Rank** row | The game's position in Steam's store lists: `DAU` (most played), `top sellers` and `wishlist activity`. A rank only appears if the game is within the top 10,000 of that list. |
+| **Store** row | Followers (members of the game's Steam community group), review count and positive review percentage. |
 | Green or red pill on a row | Today's net wishlist change (adds minus deletes). |
 | Grey number on a row | Total outstanding wishlists for that game. |
 | `~` before a peak | The widget has not yet collected 24 hours of player samples, so the peak may be incomplete. |
@@ -214,7 +218,10 @@ Restart the widget after editing `config.json`.
 | Revenue | `IPartnerFinancialsService/GetChangedDatesForPartner` + `GetDetailedSales` | Net sales in USD and net units, grouped by primary App ID. Steam publishes sales with a **1–2 day delay**, so "today" is often not available yet and the latest day is shown instead. The last 45 days are kept. |
 | Current players | [`ISteamUserStats/GetNumberOfCurrentPlayers`](https://partner.steamgames.com/doc/webapi/ISteamUserStats) (public) | The same number SteamDB shows. For unreleased apps the public endpoint returns 404, so the partner endpoint is used with your publisher key. That endpoint can include developer and test accounts. |
 | 24h peak | Collected locally | Steam has no API for historical player counts, so the widget stores one sample per refresh and shows the highest value of the last 24 hours. With hourly refreshes, short spikes between samples can be missed, so the value may be lower than SteamDB's. |
-| Game list | `ISteamApps/GetPartnerAppListForWebAPIKey` + store `appdetails` | Refreshed once a day. Demos are matched to their game through the store's `fullgame` field, or by name ("X Demo" → "X"). |
+| Game list | `ISteamApps/GetPartnerAppListForWebAPIKey` + store `appdetails` | Refreshed once a day and on every manual refresh. Demos are matched to their game through the store's `fullgame` field, or by name ("X Demo" → "X"). |
+| Store ranks | `IStoreQueryService/Query` (public) | The same store lists SteamDB uses for its store data ranks. Sort `13` is most played (DAU), `10` is top sellers and `20` is wishlist activity. The widget pages through the top 10,000 of each list once a day. Games without a store score, for example unreleased games with no sales, are left out of the sellers and DAU ranks. |
+| Reviews | `IStoreBrowseService/GetItems` (public) | Review count and positive percentage. One request per refresh for all games. |
+| Followers | `steamcommunity.com/games/<appid>/memberslistxml` (public) | The member count of the game's community group, the same number SteamDB shows as followers. The community site rate-limits heavily, so followers are refreshed at most once a day, with a 10-second gap between games. On a `429` the widget stops and retries the remaining games at the next refresh. |
 
 Median playtime has **no Web API**. It is only available on the Steamworks site, which the **Detail** link opens.
 
@@ -232,6 +239,7 @@ Everything is cached in the `data/` folder:
 | `sales.json` | Per-day revenue totals for the last 45 days. |
 | `apps.json` | Discovered games and demos. |
 | `players_history.json` | Player samples for the 24h peak. |
+| `store.json` | Store ranks, followers and reviews. |
 | `window.json` | Window position and expanded rows. |
 | `error.log` | Errors, capped at about 512 KB. |
 
@@ -256,6 +264,8 @@ Player history is collected per PC, so the 24h peak starts fresh there. If your 
 | `no apps are linked to this publisher key` | The key is from a group without apps, such as the Financial group. Use your main publisher group's key. |
 | A game shows no wishlist row | Steam returns no wishlist data for that app, for example when the store page is not public yet. |
 | A game shows no players | The app is not released and no publisher key is set. |
+| No **Rank** row | The game is not in the top 10,000 of any of the three store lists, or has no store page yet. |
+| Followers not updating | The Steam community site returned `429 Too Many Requests`. The last known value stays visible and the widget retries at the next refresh. |
 | `Steam not responding (502)` or `offline` | A temporary Steam or network problem. The cached numbers stay visible and the next refresh retries. |
 | Widget is off-screen | Delete `data/window.json` and restart the widget. |
 | Widget does not start with Windows | Run `install.bat` again from the folder's current location. |
@@ -273,7 +283,7 @@ Player history is collected per PC, so the 24h peak starts fresh there. If your 
 ## Security notes
 
 - `config.json` contains your API keys. It is listed in `.gitignore`. **Never commit it or share it publicly.** The Financial key can read all sales data for your partner account.
-- Only Steam's official endpoints are called (`partner.steam-api.com`, `api.steampowered.com`, `store.steampowered.com`). Your keys are never sent anywhere else.
+- Only Steam's official endpoints are called (`partner.steam-api.com`, `api.steampowered.com`, `store.steampowered.com`, `steamcommunity.com`). Your keys are only sent to `partner.steam-api.com`. The store and community requests are public and carry no key.
 - Consider restricting both keys to your IP addresses in Steamworks.
 
 ---

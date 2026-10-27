@@ -2,6 +2,7 @@ import ctypes
 import datetime as dt
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -23,6 +24,7 @@ PLAYERS_PATH = os.path.join(DATA_DIR, "players_history.json")
 SALES_PATH = os.path.join(DATA_DIR, "sales.json")
 LOG_PATH = os.path.join(DATA_DIR, "error.log")
 APPS_PATH = os.path.join(DATA_DIR, "apps.json")
+STORE_STATS_PATH = os.path.join(DATA_DIR, "store.json")
 
 FIN_BASE = "https://partner.steam-api.com/IPartnerFinancialsService/"
 WISHLIST_URL = FIN_BASE + "GetAppWishlistReporting/v001/"
@@ -34,12 +36,23 @@ APPLIST_URL = "https://partner.steam-api.com/ISteamApps/GetPartnerAppListForWebA
 STORE_URL = "https://store.steampowered.com/api/appdetails"
 STEAMDB_URL = "https://steamdb.info/app/{appid}/charts/"
 DETAILS_URL = "https://partner.steampowered.com/app/details/{appid}/?dateStart=2000-01-01&dateEnd={date}"
+STORE_QUERY_URL = "https://api.steampowered.com/IStoreQueryService/Query/v1/"
+STORE_ITEMS_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
+FOLLOWERS_URL = "https://steamcommunity.com/games/{appid}/memberslistxml/"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/155.0 Safari/537.36")
 
 DISCOVER_INTERVAL_S = 24 * 3600
 RECENT_DAYS = 3
 PARALLEL_REQUESTS = 3
 SALES_KEEP_DAYS = 45
 LOG_MAX_BYTES = 512 * 1024
+RANK_SORTS = {"dau": 13, "sellers": 10, "wishlist": 20}
+RANK_PAGE = 1000
+RANK_MAX_PAGES = 10
+RANK_INTERVAL_S = 24 * 3600
+FOLLOWERS_INTERVAL_S = 24 * 3600
+FOLLOWERS_GAP_S = 10
 PLACEHOLDER_PREFIX = "YOUR_"
 
 KEY = "#010203"
@@ -57,6 +70,7 @@ RED = "#f0566a"
 BLUE = "#4f8fe6"
 PURPLE = "#c061cb"
 ORANGE = "#e09a5c"
+YELLOW = "#f6d32d"
 TILE = {
     "green": ("#1f3a2b", "#33d17a", "#2ec27e"),
     "blue": ("#22304a", "#4f8fe6", None),
@@ -98,13 +112,14 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
-def http_json(url, params, timeout=20):
-    req = urllib.request.Request(
-        f"{url}?{urllib.parse.urlencode(params)}",
-        headers={"User-Agent": "SteamDataPCWidget/1.0"},
-    )
+def http_text(url, params, timeout=20, ua="SteamDataPCWidget/1.0"):
+    req = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers={"User-Agent": ua})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+        return r.read().decode("utf-8", "replace")
+
+
+def http_json(url, params, timeout=20):
+    return json.loads(http_text(url, params, timeout))
 
 
 def http_json_retry(url, params):
@@ -255,6 +270,93 @@ class SalesStore:
         return dt.date.fromisoformat(days[0]), sum(v["net"] for v in self.data["days"][days[0]].values())
 
 
+class StoreStats:
+    def __init__(self):
+        self.data = load_json(STORE_STATS_PATH, {"ranks_ts": 0, "apps": {}})
+
+    def _app(self, appid):
+        return self.data["apps"].setdefault(str(appid), {})
+
+    def for_app(self, appid):
+        return self.data["apps"].get(str(appid))
+
+    def refresh_reviews(self, appids):
+        inp = {"ids": [{"appid": a} for a in appids], "context": {"language": "english", "country_code": "US"},
+               "data_request": {"include_reviews": True}}
+        items = http_json(STORE_ITEMS_URL, {"input_json": json.dumps(inp)}).get("response", {}).get("store_items", [])
+        for it in items:
+            rv = (it.get("reviews") or {}).get("summary_filtered")
+            if it.get("appid") and rv:
+                self._app(it["appid"]).update(reviews=int(rv.get("review_count", 0)),
+                                              review_pct=int(rv.get("percent_positive", 0)))
+        save_json(STORE_STATS_PATH, self.data)
+
+    def refresh_followers(self, appids):
+        due = [a for a in appids if time.time() - self._app(a).get("followers_ts", 0) >= FOLLOWERS_INTERVAL_S]
+        for i, a in enumerate(due):
+            if i:
+                time.sleep(FOLLOWERS_GAP_S)
+            try:
+                xml = http_text(FOLLOWERS_URL.format(appid=a), {"xml": 1}, ua=BROWSER_UA)
+            except urllib.error.HTTPError as e:
+                log_error(f"followers {a}: {e}")
+                if e.code == 429:
+                    break
+                continue
+            except (urllib.error.URLError, OSError) as e:
+                log_error(f"followers {a}: {e}")
+                break
+            m = re.search(r"<groupDetails>.*?<memberCount>(\d+)", xml, re.S)
+            if m:
+                self._app(a).update(followers=int(m.group(1)), followers_ts=int(time.time()))
+            save_json(STORE_STATS_PATH, self.data)
+
+    def ranks_due(self):
+        return time.time() - self.data.get("ranks_ts", 0) >= RANK_INTERVAL_S
+
+    @staticmethod
+    def _query_page(sort, start):
+        inp = {"query_name": "widget", "context": {"language": "english", "country_code": "US"},
+               "query": {"start": start, "count": RANK_PAGE, "sort": sort}}
+        for wait in (5, 15, 30, 60, None):
+            try:
+                return http_json(STORE_QUERY_URL, {"input_json": json.dumps(inp)}).get("response", {}).get("ids", [])
+            except urllib.error.HTTPError as e:
+                if wait is None or (e.code != 429 and e.code < 500):
+                    raise
+            except (urllib.error.URLError, OSError):
+                if wait is None:
+                    raise
+            time.sleep(wait)
+
+    @staticmethod
+    def _scored(ids, j):
+        near = [it.get("appid") or 0 for it in ids[max(0, j - 10):j + 11]]
+        if len(near) < 8:
+            return True
+        return not (all(x < y for x, y in zip(near, near[1:])) or all(x > y for x, y in zip(near, near[1:])))
+
+    def refresh_ranks(self, appids, progress=None):
+        found = {}
+        for i, (name, sort) in enumerate(RANK_SORTS.items()):
+            ranks = found[name] = {}
+            for page in range(RANK_MAX_PAGES):
+                if progress and page % 10 == 0:
+                    progress(f"store ranks {i + 1}/{len(RANK_SORTS)}")
+                ids = self._query_page(sort, page * RANK_PAGE)
+                for j, it in enumerate(ids):
+                    a = it.get("appid")
+                    if a in appids and a not in ranks:
+                        ranks[a] = page * RANK_PAGE + j + 1 if self._scored(ids, j) else None
+                if not ids or len(ranks) == len(appids):
+                    break
+                time.sleep(1)
+        for a in appids:
+            self._app(a)["ranks"] = {name: found[name].get(a) for name in RANK_SORTS}
+        self.data["ranks_ts"] = int(time.time())
+        save_json(STORE_STATS_PATH, self.data)
+
+
 def _store_details(appid):
     try:
         v = http_json(STORE_URL, {"appids": appid}).get(str(appid), {})
@@ -372,6 +474,7 @@ class Widget:
         self._set_games(merge_games(self.discovered.get("games", []), self.manual_games))
         self.players = PlayerTracker(self.pub_key)
         self.sales = SalesStore(self.key)
+        self.store = StoreStats()
         self.wl_error = {}
         self.wl_nodata = set()
         self.player_now = {}
@@ -394,7 +497,7 @@ class Widget:
 
         self._setup_window()
         self.draw()
-        self.root.after(200, self.refresh_all)
+        self.root.after(200, self.manual_refresh)
 
     def _setup_window(self):
         r = self.root
@@ -426,7 +529,7 @@ class Widget:
 
         self.menu = tk.Menu(r, tearoff=0, bg=CARD_BG, fg=BODY, activebackground="#3584e4",
                             activeforeground=TEXT, bd=0)
-        self.menu.add_command(label="Refresh", command=self.refresh_all)
+        self.menu.add_command(label="Refresh", command=self.manual_refresh)
         self.topmost_var = tk.BooleanVar(value=self.topmost)
         self.menu.add_checkbutton(label="Always on top", variable=self.topmost_var, command=self._toggle_topmost)
         self.startup_var = tk.BooleanVar(value=os.path.exists(startup_path()))
@@ -529,7 +632,7 @@ class Widget:
         rx = cx - 32
         c.create_oval(rx - 12, y - 12, rx + 12, y + 12, fill=BTN_BG, outline="", tags="refresh")
         c.create_text(rx, y, text=IC_REFRESH, font=self.f_icon_s, fill=BLUE if self.busy else TEXT, tags="refresh")
-        self._on_click("refresh", self.refresh_all)
+        self._on_click("refresh", self.manual_refresh)
 
         y = 52
         tw = (W - 2 * P - 8) / 2
@@ -653,6 +756,7 @@ class Widget:
             if r["sale_day"] != today:
                 segs.append((f" · {fmt_day(r['sale_day'])}", DIM))
             lines.append(("Revenue", ORANGE, segs, None))
+        lines += self._store_lines(g.get("appid"))
 
         lh = 26
         top = y + 2
@@ -671,6 +775,31 @@ class Widget:
                 self._draw_links(link, my, today)
             ly += lh
         return bottom + 6
+
+    def _store_lines(self, appid):
+        st = self.store.for_app(appid) if appid else None
+        if not st:
+            return []
+        lines = []
+        ranks = st.get("ranks") or {}
+        segs = []
+        for name, label in (("dau", " DAU"), ("sellers", " top sellers")):
+            if ranks.get(name):
+                segs += [("   " if segs else "", DIM), (f"#{fmt(ranks[name])}", TEXT), (label, DIM)]
+        if segs:
+            lines.append(("Rank", YELLOW, segs, None))
+        if ranks.get("wishlist"):
+            lines.append(("Rank" if not segs else "", YELLOW,
+                          [(f"#{fmt(ranks['wishlist'])}", TEXT), (" wishlist activity", DIM)], None))
+        segs = []
+        if st.get("followers") is not None:
+            segs += [(fmt(st["followers"]), TEXT), (" followers", DIM)]
+        if st.get("reviews"):
+            segs += [(" · " if segs else "", DIM), (fmt(st["reviews"]), TEXT),
+                     (f" reviews {st.get('review_pct', 0)}%", DIM)]
+        if segs:
+            lines.append(("Store", YELLOW, segs, None))
+        return lines
 
     def _draw_links(self, appid, my, today):
         c, W, P = self.c, self.W, self.PAD
@@ -692,18 +821,21 @@ class Widget:
         self.c.create_text(x_right - w / 2, cy, text=text, font=self.f_pill, fill=fg, tags=tag)
         return x_right - w - 6
 
-    def refresh_all(self):
+    def refresh_all(self, rediscover=False):
         if self.busy:
             return
         self.busy = True
         self.progress_text = None
         self.draw()
-        threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(target=self._worker, args=(rediscover,), daemon=True).start()
 
-    def _discover(self):
+    def manual_refresh(self):
+        self.refresh_all(rediscover=True)
+
+    def _discover(self, force=False):
         if not self.pub_key:
             return
-        if self.games and time.time() - self.discovered.get("ts", 0) < DISCOVER_INTERVAL_S:
+        if not force and self.games and time.time() - self.discovered.get("ts", 0) < DISCOVER_INTERVAL_S:
             return
         try:
             found = discover_apps(self.pub_key, self.exclude)
@@ -724,12 +856,12 @@ class Widget:
         code = getattr(e, "code", None)
         self.steam_down = f"Steam not responding ({code})" if code else "offline"
 
-    def _worker(self):
+    def _worker(self, rediscover=False):
         self.steam_down = None
         ok = True
         redraw = lambda: self.root.after(0, self.draw)
         try:
-            self._discover()
+            self._discover(force=rediscover)
             for g in self.games:
                 for kind in ("appid", "demo_appid"):
                     a = g.get(kind)
@@ -775,11 +907,29 @@ class Widget:
                     ok = False
                     self._mark_down(e)
                     log_error(f"sales: {e if is_transient(e) else traceback.format_exc()}")
+            self._refresh_store(redraw)
             if ok:
                 self.last_update = dt.datetime.now()
         finally:
             self.busy = False
             redraw()
+
+    def _refresh_store(self, redraw):
+        appids = [g["appid"] for g in self.games if g.get("appid")]
+        if not appids:
+            return
+        try:
+            self.progress_text = "updating store data…"
+            redraw()
+            self.store.refresh_reviews(appids)
+            self.store.refresh_followers(appids)
+            if self.store.ranks_due():
+                def progress(text):
+                    self.progress_text = text
+                    redraw()
+                self.store.refresh_ranks(set(appids), progress)
+        except Exception as e:
+            log_error(f"store: {e if is_transient(e) else traceback.format_exc()}")
 
     def schedule(self):
         interval = max(1, int(self.config.get("refresh_interval_min", 60))) * 60

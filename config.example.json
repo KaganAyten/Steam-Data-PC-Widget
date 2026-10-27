@@ -1,0 +1,9 @@
+{
+  "financial_api_key": "YOUR_FINANCIAL_API_KEY",
+  "publisher_api_key": "YOUR_PUBLISHER_API_KEY",
+  "exclude_appids": [],
+  "games": [],
+  "refresh_interval_min": 60,
+  "day_start_hour": 10,
+  "opacity": 0.97
+}
